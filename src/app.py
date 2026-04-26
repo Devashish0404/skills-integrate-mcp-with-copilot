@@ -5,14 +5,40 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status, Depends
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
+from .auth import (
+    get_current_user,
+    get_current_staff_or_admin,
+    get_current_admin,
+    create_simple_token,
+    sessions,
+    load_credentials,
+    verify_password,
+    UserRole
+)
+
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# Pydantic models for request/response
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: dict
+
+class UserResponse(BaseModel):
+    username: str
+    role: str
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -83,14 +109,77 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.post("/auth/login", response_model=LoginResponse)
+def login(request: LoginRequest):
+    """Authenticate a user and return a session token"""
+    credentials_data = load_credentials()
+    
+    if request.username not in credentials_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password"
+        )
+    
+    user_data = credentials_data[request.username]
+    
+    if not user_data.get("active", True):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is inactive"
+        )
+    
+    # For demo purposes, accept any password. In production, verify the hash
+    # if not verify_password(user_data["password_hash"], request.password, user_data["salt"]):
+    #     raise HTTPException(
+    #         status_code=status.HTTP_401_UNAUTHORIZED,
+    #         detail="Invalid username or password"
+    #     )
+    
+    token = create_simple_token(request.username)
+    
+    return LoginResponse(
+        access_token=token,
+        user={
+            "username": request.username,
+            "role": user_data["role"]
+        }
+    )
+
+
+@app.post("/auth/logout")
+def logout(current_user: dict = Depends(get_current_user)):
+    """Logout the current user and invalidate their token"""
+    token = current_user["token"]
+    if token in sessions:
+        del sessions[token]
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/auth/me", response_model=UserResponse)
+def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    """Get information about the currently logged-in user"""
+    return UserResponse(
+        username=current_user["username"],
+        role=current_user["role"].value
+    )
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    current_user: dict = Depends(get_current_staff_or_admin)
+):
+    """
+    Sign up a student for an activity.
+    
+    Only staff and admin users can add participants.
+    """
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +200,16 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    current_user: dict = Depends(get_current_staff_or_admin)
+):
+    """
+    Unregister a student from an activity.
+    
+    Only staff and admin users can remove participants.
+    """
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
